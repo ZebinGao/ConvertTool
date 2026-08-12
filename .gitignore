@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ===== 本项目生成物 / 源文件（勿上传）=====
+# 源 PDF（扫描书，体积大且有版权）
+*.pdf
+# OCR 逐页缓存、留白密度缓存（按 PDF 文件名生成）
+*_ocrcache/
+.*_ocrcache/
+*_density.json
+.*_density.json
+# 转换输出
+/output/
+# 临时测试脚本
+/bench.py
+/integ*.py
