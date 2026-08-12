@@ -252,6 +252,97 @@ def _reconstruct_vertical(lines: list[_Line]) -> str:
     return out.strip()
 
 
+# ---------- 横排多栏（扫描杂志 / 学术书）阅读顺序重建 ----------
+def _lines_from_boxes(txts, boxes) -> list[_Line]:
+    """从 rapidocr 的 (txts, boxes) 构建 _Line 列表。boxes 形如 [N,4,2] 的像素坐标。"""
+    import numpy as np
+    lines: list[_Line] = []
+    for t, b in zip(txts, boxes):
+        b = np.asarray(b)
+        xs, ys = b[:, 0], b[:, 1]
+        lines.append(_Line(str(t), float(xs.min()), float(ys.min()),
+                           float(xs.max()), float(ys.max())))
+    return lines
+
+
+def _count_side_by_side(lines: list[_Line], page_w: float) -> int:
+    """统计「有并排邻居」的行数：同一高度(y 区间重叠)且横向不交叠(一左一右)。
+
+    这是区分单/双栏的本质判据——双栏页同高度有左右两段文字并排；单栏页所有行
+    上下堆叠、无并排。比「x 中心间距」(单栏里的短行会被误判成单独一列)和
+    「中段密度谷」(任何跨栏标题/水印横穿中段都会把谷填平)都稳得多。
+    按 y0 排序后用扫描窗口，复杂度 ≈ O(n·窗口宽)。"""
+    n = len(lines)
+    if n < 6:
+        return 0
+    gap_min = 0.02 * page_w          # 横向至少隔 2% 页宽才算「不交叠」
+    with_nbr = [False] * n
+    order = sorted(range(n), key=lambda i: lines[i].y0)
+    for a in range(n):
+        i = order[a]
+        li = lines[i]
+        for b in range(a + 1, n):
+            j = order[b]
+            lj = lines[j]
+            if lj.y0 > li.y1:        # j 已在 i 下方，其后更下，不再可能重叠
+                break
+            if min(li.y1, lj.y1) - max(li.y0, lj.y0) <= 0:
+                continue
+            if (li.x1 + gap_min <= lj.x0) or (lj.x1 + gap_min <= li.x0):
+                with_nbr[i] = with_nbr[j] = True
+    return sum(with_nbr)
+
+
+def _column_gutter(lines: list[_Line], page_w: float) -> float:
+    """估算左右栏分界 x：取所有「并排对」边界中点的中位数。
+
+    用实际不交叠对的边界定位栏沟，比「行覆盖密度的最小值」稳——后者会被偏宽的
+    OCR 检测框填满（很多框略越过栏沟，密度谷就不明显了）。"""
+    import statistics
+    gap_min = 0.02 * page_w
+    mids: list[float] = []
+    for i in range(len(lines)):
+        li = lines[i]
+        for j in range(i + 1, len(lines)):
+            lj = lines[j]
+            if min(li.y1, lj.y1) - max(li.y0, lj.y0) <= 0:
+                continue
+            if li.x1 + gap_min <= lj.x0:
+                mids.append((li.x1 + lj.x0) / 2)
+            elif lj.x1 + gap_min <= li.x0:
+                mids.append((lj.x1 + li.x0) / 2)
+    return statistics.median(mids) if mids else page_w / 2
+
+
+def _order_horizontal(lines: list[_Line], page_w: float) -> list[_Line]:
+    """横排版面阅读顺序：多栏 → 列从左到右、列内从上到下；单栏 → 按 y 从上到下。
+
+    输出仍是「一行一条」(每个 _Line 一条)，段落合并交给下游 _unwrap_text。
+    双栏页左列底→右列顶本是连续正文，_unwrap_text 的软换行合并正好接上，无需特殊处理。"""
+    if not lines:
+        return []
+    nbr = _count_side_by_side(lines, page_w)
+    if nbr < 5 or nbr < 0.2 * len(lines):     # 不足 5 行或不足 20% → 单栏
+        return sorted(lines, key=lambda z: (z.y0, z.x0))
+    gutter = _column_gutter(lines, page_w)
+    left = sorted((ln for ln in lines if ln.xc <= gutter), key=lambda z: z.y0)
+    right = sorted((ln for ln in lines if ln.xc > gutter), key=lambda z: z.y0)
+    return left + right
+
+
+def _ocr_text_from_result(txts, boxes, page_w: float) -> str:
+    """把 rapidocr 单页结果按版面排成纯文本（每行一条），供下游清洗 / unwrap。
+
+    竖排走 _reconstruct_vertical；横排走 _order_horizontal（含多栏检测）。
+    两条 OCR 路径（CLI 的 _ocr_page、GUI worker）共用此函数，保证一致。"""
+    if not txts:
+        return ""
+    lines = _lines_from_boxes(txts, boxes)
+    if _is_vertical_page(lines):
+        return _reconstruct_vertical(lines)
+    return "\n".join(ln.text for ln in _order_horizontal(lines, page_w))
+
+
 # ---------- OCR（扫描 / 图片页）----------
 _OCR_ENGINE = None
 
@@ -273,7 +364,7 @@ def _get_ocr():
 
 
 def _ocr_page(page, dpi: int) -> str:
-    """把单页渲染成图片并 OCR，返回识别出的文本。"""
+    """把单页渲染成图片并 OCR，返回识别出的文本（已按版面排好阅读顺序）。"""
     import numpy as np
     pix = page.get_pixmap(dpi=dpi)
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
@@ -281,11 +372,12 @@ def _ocr_page(page, dpi: int) -> str:
         img = img[:, :, :3]
     elif pix.n == 1:                    # 灰度 → 三通道
         img = np.stack([img[:, :, 0]] * 3, axis=2)
-    # 新版 rapidocr 返回 RapidOCROutput（取 .txts）；显式 use_cls=True 保留方向分类器，竖排友好
+    # 新版 rapidocr 返回 RapidOCROutput（.txts + .boxes）；use_cls=True 保留方向分类器，竖排友好。
+    # 关键：用 .boxes 按版面重排阅读顺序（横排多栏按列、竖排按列），否则双栏会被按行交错拼乱。
     result = _get_ocr()(img, use_cls=True)
     if result is None or result.txts is None:
         return ""
-    return "\n".join(result.txts)
+    return _ocr_text_from_result(result.txts, result.boxes, pix.width)
 
 
 # ---------- 繁体转简体 ----------

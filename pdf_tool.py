@@ -92,18 +92,31 @@ _CHAP_LINE = re.compile(
     r"^(?:第[一二三四五六七八九十百千零〇两\d]+[章回节篇卷折幕]"
     r"|序言?|楔子|引子|前言|后记|尾声|跋|序章|终章|番外篇?)$"
 )
+# 孤立的拉丁短串（如扫描杂志的 "MOOK" 水印 / 刊头）：仅整行纯字母、长度 ≤12 时，
+# 且本页以中文为主，才判为水印丢弃——避免误伤英文页的正文单词。
+_LATIN_WATERMARK = re.compile(r"^[A-Za-z]{2,12}$")
+# 内联水印词（OCR 偶尔把水印和正文拼到同一行，如 "MOOK 第二十二卷"）：
+# 中文页里去掉 MOOK / MOOCK（本系列刊头水印，正文不会出现该词）。
+_WATERMARK_INLINE = re.compile(r"MOOC?K", re.IGNORECASE)
 
 
 def _clean_scanned_page(text: str) -> str:
     """单页 OCR 文本的预处理（unwrap 之前调用）：
       - 删掉独立成行的页码 "160" / "第N页"（否则会被软换行合并进正文）；
+      - 删掉中文页里的拉丁水印/刊头（独立成行的 "MOOK"，及内联的 "MOOK 第二十二卷"）；
       - 让章节标题独占段落（前后补空行，否则 "第二十三章" 会和本章正文粘连）。
     """
+    cjk = sum(1 for ch in text if "一" <= ch <= "鿿")
+    chinese_page = cjk >= 20
+    if chinese_page:
+        text = _WATERMARK_INLINE.sub("", text)     # 先去掉内联水印词
     out = []
     for ln in text.split("\n"):
         s = ln.strip()
         if s and (_PAGE_NUM_LINE.match(s) or _PAGE_NUM_ZH_LINE.match(s)):
             continue  # 丢弃页码行
+        if chinese_page and _LATIN_WATERMARK.match(s):
+            continue  # 丢弃独立成行的水印/刊头
         if len(s) <= 12 and _CHAP_LINE.match(s):
             out.append("")      # 标题前空行 → 新段落
             out.append(s)
@@ -189,7 +202,11 @@ def _ocr_one_page_worker(global_page_no: int, dpi: int, cache_dir: str) -> tuple
     elif pix.n == 1:
         arr = np.stack([arr[:, :, 0]] * 3, axis=2)
     result = _worker_get_ocr()(arr, use_cls=True)
-    text = "\n".join(result.txts) if (result and result.txts) else ""
+    # 用 .boxes 按版面重排阅读顺序（横排多栏按列、竖排按列），否则双栏页会被按行交错拼乱。
+    if result and result.txts:
+        text = pdf2txt._ocr_text_from_result(result.txts, result.boxes, pix.width)
+    else:
+        text = ""
     # 释放大数组
     del arr, pix
     try:
